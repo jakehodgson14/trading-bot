@@ -273,10 +273,19 @@ def webhook():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Set webhook on startup
+    # Build webhook URL
     webhook_url = f"https://{render_url}/{telegram_token}"
+    print("🚀 Setting webhook to:", webhook_url)   # DEBUG: show final URL
+
     bot.remove_webhook()
     bot.set_webhook(url=webhook_url)
+
+    # Kick off background scan
+    threading.Timer(2.0, background_scan).start()
+
+    print("🤖 Bot running with webhooks…")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
 
     # Kick off background scan
     threading.Timer(2.0, background_scan).start()
