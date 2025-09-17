@@ -285,10 +285,3 @@ if __name__ == "__main__":
 
     print("🤖 Bot running with webhooks…")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
-
-    # Kick off background scan
-    threading.Timer(2.0, background_scan).start()
-
-    print("🤖 Bot running with webhooks…")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
