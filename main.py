@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import base64
 import threading
 from typing import List, Dict, Any
@@ -9,6 +8,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import telebot
 import yfinance as yf
+from flask import Flask, request
 
 # ========= CONFIG =========
 SCAN_INTERVAL_SECONDS = 15 * 60   # background scan every 15 minutes
@@ -21,9 +21,10 @@ creds_b64 = os.getenv("GOOGLE_CREDENTIALS_B64")
 sheet_id = os.getenv("SHEET_ID")
 telegram_token = os.getenv("TELEGRAM_TOKEN")
 telegram_id = os.getenv("TELEGRAM_ID")
+render_url = os.getenv("RENDER_EXTERNAL_URL")
 
-if not all([creds_b64, sheet_id, telegram_token, telegram_id]):
-    raise RuntimeError("Missing one or more environment variables: GOOGLE_CREDENTIALS_B64, SHEET_ID, TELEGRAM_TOKEN, TELEGRAM_ID")
+if not all([creds_b64, sheet_id, telegram_token, telegram_id, render_url]):
+    raise RuntimeError("Missing one or more environment variables: GOOGLE_CREDENTIALS_B64, SHEET_ID, TELEGRAM_TOKEN, TELEGRAM_ID, RENDER_EXTERNAL_URL")
 
 # ===== Google Auth =====
 creds_json = base64.b64decode(creds_b64).decode("utf-8")
@@ -40,7 +41,9 @@ except Exception:
 
 # ===== Telegram Bot =====
 bot = telebot.TeleBot(telegram_token)
+app = Flask(__name__)
 
+# ===== Helpers =====
 def safe_float(x) -> float:
     try:
         if x is None or x == "":
@@ -66,24 +69,20 @@ def load_watchlist() -> List[Dict[str, Any]]:
         })
     return out
 
-def fetch_quote(ticker: str) -> Dict[str, Any]:
-    """
-    Returns dict with price info using yfinance:
-    { 'ticker', 'price', 'prev_close', 'change_pct_1d' }
-    """
+def fetch_quote(ticker: str, interval: str = "1d", period: str = "5d") -> Dict[str, Any]:
+    """ Returns dict with price info using yfinance """
     try:
         t = yf.Ticker(ticker)
-        hist = t.history(period="2d", interval="1d")
+        hist = t.history(period=period, interval=interval)
         if hist.empty:
             return {"ticker": ticker, "price": float("nan"),
                     "prev_close": float("nan"), "change_pct_1d": float("nan")}
 
         price = float(hist["Close"].iloc[-1])
         prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float("nan")
+        change_pct = (price - prev_close) / prev_close * 100.0 if prev_close == prev_close else float("nan")
 
-        change_pct_1d = (price - prev_close) / prev_close * 100.0 if prev_close and prev_close == prev_close else float("nan")
-
-        return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct_1d}
+        return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
     except Exception as e:
         return {"ticker": ticker, "price": float("nan"),
                 "prev_close": float("nan"), "change_pct_1d": float("nan"),
@@ -131,6 +130,7 @@ def build_status_line(q: Dict[str, Any], pl: Dict[str, Any]) -> str:
         f"({format_money(pl['pl_abs'])}, {format_pct(pl['pl_pct'])})"
     )
 
+# ===== Background scan =====
 def background_scan():
     try:
         wl = load_watchlist()
@@ -188,7 +188,7 @@ def cmd_help(message):
         "📖 Commands:\n"
         "/status – bot + sheet health\n"
         "/tickers – list watchlist tickers\n"
-        "/price TICKER – live price (e.g. /price AAPL)\n"
+        "/price TICKER [interval] – live price (default daily)\n"
         "/rows – number of rows in watchlist\n"
         "/report – snapshot P/L & moves\n"
         "/watch – re-read sheet now"
@@ -215,14 +215,29 @@ def cmd_tickers(message):
 def cmd_price(message):
     parts = message.text.strip().split()
     if len(parts) < 2:
-        bot.reply_to(message, "Usage: /price TICKER")
+        bot.reply_to(message, "Usage: /price TICKER [interval]\nExample: /price TSLA 1h")
         return
+
     ticker = parts[1].upper()
-    q = fetch_quote(ticker)
+    interval = parts[2] if len(parts) > 2 else "1d"
+
+    # Map interval → suitable period
+    if interval.endswith("m"):  # intraday minutes
+        period = "5d"
+    elif interval.endswith("h"):  # hourly
+        period = "1mo"
+    elif interval in ("1d", "5d"):
+        period = "1mo"
+    else:
+        period = "6mo"
+
+    q = fetch_quote(ticker, interval=interval, period=period)
+
     if "error" in q:
         bot.reply_to(message, f"{ticker}: Error fetching data ({q['error']})")
     else:
-        bot.reply_to(message, f"{ticker}: {format_money(q['price'])} | 1D {format_pct(q['change_pct_1d'])}")
+        bot.reply_to(message,
+            f"{ticker} [{interval}]: {format_money(q['price'])} | Δ {format_pct(q['change_pct_1d'])}")
 
 @bot.message_handler(commands=['rows'])
 def cmd_rows(message):
@@ -250,9 +265,21 @@ def cmd_report(message):
         lines.append("• " + build_status_line(q, pl))
     bot.reply_to(message, "\n".join(lines))
 
-# ===== Startup =====
-bot.send_message(chat_id=telegram_id, text="✅ Copilot Cockpit online. Use /help for commands.")
-threading.Timer(2.0, background_scan).start()
+# ===== Flask Webhook =====
+@app.route(f"/{telegram_token}", methods=["POST"])
+def webhook():
+    update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+    bot.process_new_updates([update])
+    return "ok", 200
 
-print("🤖 Running…")
-bot.infinity_polling(timeout=30, long_polling_timeout=30)
+if __name__ == "__main__":
+    # Set webhook on startup
+    webhook_url = f"https://{render_url}/{telegram_token}"
+    bot.remove_webhook()
+    bot.set_webhook(url=webhook_url)
+
+    # Kick off background scan
+    threading.Timer(2.0, background_scan).start()
+
+    print("🤖 Bot running with webhooks…")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
