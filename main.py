@@ -273,9 +273,11 @@ def webhook():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Build webhook URL
-    webhook_url = f"https://{render_url}/{telegram_token}"
-    print("🚀 Setting webhook to:", webhook_url)   # DEBUG: show final URL
+# Strip protocol if someone put https:// by mistake
+clean_url = render_url.replace("https://", "").replace("http://", "").strip("/")
+webhook_url = f"https://{clean_url}/{telegram_token}"
+print("🚀 Setting webhook to:", webhook_url)
+
 
     bot.remove_webhook()
     bot.set_webhook(url=webhook_url)
