@@ -12,8 +12,8 @@ from flask import Flask, request
 
 # ========= CONFIG =========
 SCAN_INTERVAL_SECONDS = 15 * 60   # background scan every 15 minutes
-WATCH_SHEET_NAME = "Watchlist"    # tab name with your tickers (first row = headers as documented)
-MIN_SURGE_TIERS = [15, 20, 30]    # % surge tiers for alerts (24h change)
+WATCH_SHEET_NAME = "Watchlist"    # tab name with your tickers
+MIN_SURGE_TIERS = [15, 20, 30]    # % surge tiers for alerts
 # ==========================
 
 # ======== ENV ========
@@ -24,7 +24,7 @@ telegram_id = os.getenv("TELEGRAM_ID")
 render_url = os.getenv("RENDER_EXTERNAL_URL")
 
 if not all([creds_b64, sheet_id, telegram_token, telegram_id, render_url]):
-    raise RuntimeError("Missing one or more environment variables: GOOGLE_CREDENTIALS_B64, SHEET_ID, TELEGRAM_TOKEN, TELEGRAM_ID, RENDER_EXTERNAL_URL")
+    raise RuntimeError("Missing one or more environment variables")
 
 # ===== Google Auth =====
 creds_json = base64.b64decode(creds_b64).decode("utf-8")
@@ -69,20 +69,43 @@ def load_watchlist() -> List[Dict[str, Any]]:
         })
     return out
 
-def fetch_quote(ticker: str, interval: str = "1d", period: str = "5d") -> Dict[str, Any]:
-    """ Returns dict with price info using yfinance """
+def fetch_quote(ticker: str, interval: str = "1d", period: str = None) -> Dict[str, Any]:
+    """
+    Returns dict with price info using yfinance with fast_info fallback.
+    """
     try:
         t = yf.Ticker(ticker)
+
+        # auto-choose period if not provided
+        if not period:
+            if interval.endswith("m"):
+                period = "5d"
+            elif interval.endswith("h"):
+                period = "1mo"
+            else:
+                period = "5d"
+
         hist = t.history(period=period, interval=interval)
-        if hist.empty:
-            return {"ticker": ticker, "price": float("nan"),
-                    "prev_close": float("nan"), "change_pct_1d": float("nan")}
 
-        price = float(hist["Close"].iloc[-1])
-        prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float("nan")
-        change_pct = (price - prev_close) / prev_close * 100.0 if prev_close == prev_close else float("nan")
+        if not hist.empty and len(hist["Close"]) > 0:
+            price = float(hist["Close"].iloc[-1])
+            prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float("nan")
+            change_pct = (price - prev_close) / prev_close * 100.0 if prev_close == prev_close else float("nan")
 
-        return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
+            return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
+
+        # fallback to fast_info
+        if hasattr(t, "fast_info"):
+            fi = t.fast_info
+            price = getattr(fi, "last_price", float("nan"))
+            prev_close = getattr(fi, "previous_close", float("nan"))
+            change_pct = (price - prev_close) / prev_close * 100.0 if prev_close == prev_close else float("nan")
+
+            return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
+
+        return {"ticker": ticker, "price": float("nan"),
+                "prev_close": float("nan"), "change_pct_1d": float("nan")}
+
     except Exception as e:
         return {"ticker": ticker, "price": float("nan"),
                 "prev_close": float("nan"), "change_pct_1d": float("nan"),
@@ -188,7 +211,7 @@ def cmd_help(message):
         "📖 Commands:\n"
         "/status – bot + sheet health\n"
         "/tickers – list watchlist tickers\n"
-        "/price TICKER [interval] – live price (default daily)\n"
+        "/price TICKER [interval] – live price\n"
         "/rows – number of rows in watchlist\n"
         "/report – snapshot P/L & moves\n"
         "/watch – re-read sheet now"
@@ -215,29 +238,15 @@ def cmd_tickers(message):
 def cmd_price(message):
     parts = message.text.strip().split()
     if len(parts) < 2:
-        bot.reply_to(message, "Usage: /price TICKER [interval]\nExample: /price TSLA 1h")
+        bot.reply_to(message, "Usage: /price TICKER [interval]")
         return
-
     ticker = parts[1].upper()
     interval = parts[2] if len(parts) > 2 else "1d"
-
-    # Map interval → suitable period
-    if interval.endswith("m"):  # intraday minutes
-        period = "5d"
-    elif interval.endswith("h"):  # hourly
-        period = "1mo"
-    elif interval in ("1d", "5d"):
-        period = "1mo"
-    else:
-        period = "6mo"
-
-    q = fetch_quote(ticker, interval=interval, period=period)
-
+    q = fetch_quote(ticker, interval=interval)
     if "error" in q:
         bot.reply_to(message, f"{ticker}: Error fetching data ({q['error']})")
     else:
-        bot.reply_to(message,
-            f"{ticker} [{interval}]: {format_money(q['price'])} | Δ {format_pct(q['change_pct_1d'])}")
+        bot.reply_to(message, f"{ticker} [{interval}]: {format_money(q['price'])} | Δ {format_pct(q['change_pct_1d'])}")
 
 @bot.message_handler(commands=['rows'])
 def cmd_rows(message):
@@ -272,13 +281,8 @@ def webhook():
     bot.process_new_updates([update])
     return "ok", 200
 
-# ===== Healthcheck =====
-@app.route("/ping", methods=["GET"])
-def ping():
-    return "pong", 200
-
 if __name__ == "__main__":
-    # Strip protocol if someone put https:// by mistake
+    # Strip protocol if present
     clean_url = render_url.replace("https://", "").replace("http://", "").strip("/")
     webhook_url = f"https://{clean_url}/{telegram_token}"
     print("🚀 Setting webhook to:", webhook_url)
