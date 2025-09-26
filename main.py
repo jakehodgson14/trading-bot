@@ -7,13 +7,13 @@ from typing import List, Dict, Any
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import telebot
-import yfinance as yf
+import finnhub
 from flask import Flask, request
 
 # ========= CONFIG =========
 SCAN_INTERVAL_SECONDS = 15 * 60   # background scan every 15 minutes
-WATCH_SHEET_NAME = "Watchlist"    # tab name with your tickers
-MIN_SURGE_TIERS = [15, 20, 30]    # % surge tiers for alerts
+WATCH_SHEET_NAME = "Watchlist"    # tab name with your tickers (first row = headers as documented)
+MIN_SURGE_TIERS = [15, 20, 30]    # % surge tiers for alerts (24h change)
 # ==========================
 
 # ======== ENV ========
@@ -22,9 +22,10 @@ sheet_id = os.getenv("SHEET_ID")
 telegram_token = os.getenv("TELEGRAM_TOKEN")
 telegram_id = os.getenv("TELEGRAM_ID")
 render_url = os.getenv("RENDER_EXTERNAL_URL")
+finnhub_key = os.getenv("FINNHUB_KEY")
 
-if not all([creds_b64, sheet_id, telegram_token, telegram_id, render_url]):
-    raise RuntimeError("Missing one or more environment variables")
+if not all([creds_b64, sheet_id, telegram_token, telegram_id, render_url, finnhub_key]):
+    raise RuntimeError("Missing one or more environment variables.")
 
 # ===== Google Auth =====
 creds_json = base64.b64decode(creds_b64).decode("utf-8")
@@ -42,6 +43,9 @@ except Exception:
 # ===== Telegram Bot =====
 bot = telebot.TeleBot(telegram_token)
 app = Flask(__name__)
+
+# ===== Finnhub Client =====
+finnhub_client = finnhub.Client(api_key=finnhub_key)
 
 # ===== Helpers =====
 def safe_float(x) -> float:
@@ -69,43 +73,25 @@ def load_watchlist() -> List[Dict[str, Any]]:
         })
     return out
 
-def fetch_quote(ticker: str, interval: str = "1d", period: str = None) -> Dict[str, Any]:
+def map_symbol(ticker: str) -> str:
+    """Decide if ticker is stock or crypto"""
+    crypto_list = ["BTC", "ETH", "SOL", "DOGE", "XRP"]
+    if ticker in crypto_list:
+        return f"BINANCE:{ticker}USDT"
+    return ticker
+
+def fetch_quote(ticker: str) -> Dict[str, Any]:
     """
-    Returns dict with price info using yfinance with fast_info fallback.
+    Returns dict with price info using Finnhub:
+    { 'ticker', 'price', 'prev_close', 'change_pct_1d' }
     """
     try:
-        t = yf.Ticker(ticker)
-
-        # auto-choose period if not provided
-        if not period:
-            if interval.endswith("m"):
-                period = "5d"
-            elif interval.endswith("h"):
-                period = "1mo"
-            else:
-                period = "5d"
-
-        hist = t.history(period=period, interval=interval)
-
-        if not hist.empty and len(hist["Close"]) > 0:
-            price = float(hist["Close"].iloc[-1])
-            prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else float("nan")
-            change_pct = (price - prev_close) / prev_close * 100.0 if prev_close == prev_close else float("nan")
-
-            return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
-
-        # fallback to fast_info
-        if hasattr(t, "fast_info"):
-            fi = t.fast_info
-            price = getattr(fi, "last_price", float("nan"))
-            prev_close = getattr(fi, "previous_close", float("nan"))
-            change_pct = (price - prev_close) / prev_close * 100.0 if prev_close == prev_close else float("nan")
-
-            return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
-
-        return {"ticker": ticker, "price": float("nan"),
-                "prev_close": float("nan"), "change_pct_1d": float("nan")}
-
+        mapped = map_symbol(ticker)
+        q = finnhub_client.quote(mapped)
+        price = q.get("c", float("nan"))   # current price
+        prev_close = q.get("pc", float("nan"))
+        change_pct = ((price - prev_close) / prev_close * 100.0) if prev_close and prev_close == prev_close else float("nan")
+        return {"ticker": ticker, "price": price, "prev_close": prev_close, "change_pct_1d": change_pct}
     except Exception as e:
         return {"ticker": ticker, "price": float("nan"),
                 "prev_close": float("nan"), "change_pct_1d": float("nan"),
@@ -211,7 +197,7 @@ def cmd_help(message):
         "📖 Commands:\n"
         "/status – bot + sheet health\n"
         "/tickers – list watchlist tickers\n"
-        "/price TICKER [interval] – live price\n"
+        "/price TICKER – live price (stocks or crypto)\n"
         "/rows – number of rows in watchlist\n"
         "/report – snapshot P/L & moves\n"
         "/watch – re-read sheet now"
@@ -238,15 +224,16 @@ def cmd_tickers(message):
 def cmd_price(message):
     parts = message.text.strip().split()
     if len(parts) < 2:
-        bot.reply_to(message, "Usage: /price TICKER [interval]")
+        bot.reply_to(message, "Usage: /price TICKER\nExamples: /price TSLA, /price BTC")
         return
+
     ticker = parts[1].upper()
-    interval = parts[2] if len(parts) > 2 else "1d"
-    q = fetch_quote(ticker, interval=interval)
+    q = fetch_quote(ticker)
+
     if "error" in q:
         bot.reply_to(message, f"{ticker}: Error fetching data ({q['error']})")
     else:
-        bot.reply_to(message, f"{ticker} [{interval}]: {format_money(q['price'])} | Δ {format_pct(q['change_pct_1d'])}")
+        bot.reply_to(message, f"{ticker}: {format_money(q['price'])} | 1D {format_pct(q['change_pct_1d'])}")
 
 @bot.message_handler(commands=['rows'])
 def cmd_rows(message):
@@ -282,7 +269,7 @@ def webhook():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Strip protocol if present
+    # Build webhook URL
     clean_url = render_url.replace("https://", "").replace("http://", "").strip("/")
     webhook_url = f"https://{clean_url}/{telegram_token}"
     print("🚀 Setting webhook to:", webhook_url)
