@@ -7,3 +7,5 @@ pandas==2.2.3
 numpy==2.1.2
 requests==2.31.0
 gunicorn==21.2.0
+python-dateutil==2.9.0.post0
+tzdata==2025.1
